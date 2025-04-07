@@ -13,6 +13,8 @@ from typing import Dict, List
 import sqlite3
 from datetime import datetime
 import json
+from google.oauth2 import service_account
+import pickle
 
 # Configuración de la página
 st.set_page_config(
@@ -33,6 +35,12 @@ if not api_key:
 # Crear el cliente de OpenAI una sola vez
 client = OpenAI(api_key=api_key)
 
+# Configuración de Google Sheets
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file']
+SHEET_ID = '1OCZfwayh4yUplVjGc2xZTrroYvO22SiC48sbGbKylt8'  # ID correcto de la hoja
+CREDENTIALS_FILE = 'credentials.json'
+TOKEN_FILE = 'token.pickle'
+
 # Título y descripción
 st.title("✈️ JetSMART Content Manager")
 st.markdown("""
@@ -42,64 +50,47 @@ st.markdown("""
 
 # Función para autenticación con Google Sheets
 def get_google_sheets_service():
-    """Obtener servicio de Google Sheets con manejo de errores mejorado"""
-    try:
-        SCOPES = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive.file',
-            'https://www.googleapis.com/auth/drive'
-        ]
-        creds = None
-        
-        # Verificar si existe el archivo credentials.json
-        if not os.path.exists('credentials.json'):
-            st.error("❌ No se encontró el archivo credentials.json")
-            st.info("Por favor, asegúrate de tener el archivo credentials.json en el directorio del proyecto")
-            return None
-        
-        # Verificar/cargar token existente
-        if os.path.exists('token.json'):
+    """Inicializar y retornar el servicio de Google Sheets"""
+    creds = None
+    
+    # Cargar credenciales existentes si están disponibles
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, 'rb') as token:
             try:
-                creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+                creds = pickle.load(token)
             except Exception as e:
-                st.warning("⚠️ El token existente no es válido, se generará uno nuevo")
-                if os.path.exists('token.json'):
-                    os.remove('token.json')
+                st.error(f"Error al cargar el token: {str(e)}")
+                os.remove(TOKEN_FILE)  # Eliminar token inválido
+    
+    # Si no hay credenciales válidas, solicitar autorización
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                st.error(f"Error al refrescar el token: {str(e)}")
                 creds = None
-        
-        # Si no hay credenciales válidas, solicitar autorización
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                except Exception as e:
-                    st.warning("⚠️ Error al refrescar el token, se solicitará nueva autorización")
-                    creds = None
-            
-            if not creds:
-                try:
-                    flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-                    creds = flow.run_local_server(port=0)
-                    
-                    # Guardar las credenciales para la próxima ejecución
-                    with open('token.json', 'w') as token:
-                        token.write(creds.to_json())
-                    st.success("✅ Nuevas credenciales generadas exitosamente")
-                except Exception as e:
-                    st.error(f"❌ Error durante la autorización: {str(e)}")
-                    return None
-        
+        else:
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+                creds = flow.run_local_server(port=0, success_message="Autenticación exitosa!")
+                # Guardar las credenciales para la próxima ejecución
+                with open(TOKEN_FILE, 'wb') as token:
+                    pickle.dump(creds, token)
+            except Exception as e:
+                st.error(f"Error en el flujo de autorización: {str(e)}")
+                return None
+    
+    try:
         # Construir el servicio
-        try:
-            service = build('sheets', 'v4', credentials=creds)
-            return service
-        except Exception as e:
-            st.error(f"❌ Error al construir el servicio de Google Sheets: {str(e)}")
-            return None
-            
+        service = build('sheets', 'v4', credentials=creds)
+        return service
     except Exception as e:
-        st.error(f"❌ Error en la autenticación de Google Sheets: {str(e)}")
+        st.error(f"Error al construir el servicio: {str(e)}")
         return None
+
+# Inicializar el servicio de Google Sheets
+sheet_service = get_google_sheets_service()
 
 # Función para cargar datos desde Google Sheets
 def load_sheet_data():
@@ -130,186 +121,156 @@ def load_sheet_data():
         st.error(f"Error al cargar los datos: {str(e)}")
         return None
 
-# Función para guardar datos en Google Sheets
+def verify_or_create_sheet():
+    """Verificar si la hoja existe y crearla si no existe"""
+    global SHEET_ID
+    try:
+        # Intentar obtener información de la hoja
+        sheet_metadata = sheet_service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+        st.write("Debug - Hoja existente encontrada")
+        
+        # Verificar que la hoja 'Destinos' existe
+        sheet_exists = False
+        for sheet in sheet_metadata.get('sheets', []):
+            if sheet['properties']['title'] == 'Destinos':
+                sheet_exists = True
+                break
+        
+        if not sheet_exists:
+            # Crear la hoja 'Destinos' si no existe
+            body = {
+                'requests': [{
+                    'addSheet': {
+                        'properties': {
+                            'title': 'Destinos'
+                        }
+                    }
+                }]
+            }
+            sheet_service.spreadsheets().batchUpdate(
+                spreadsheetId=SHEET_ID,
+                body=body
+            ).execute()
+            st.write("Debug - Hoja 'Destinos' creada")
+        
+        return True
+    except Exception as e:
+        st.write("Debug - La hoja no existe o hay un error, creando una nueva...")
+        try:
+            # Crear una nueva hoja de cálculo
+            spreadsheet = {
+                'properties': {
+                    'title': 'Destinos JetSMART'
+                },
+                'sheets': [{
+                    'properties': {
+                        'title': 'Destinos'
+                    }
+                }]
+            }
+            spreadsheet = sheet_service.spreadsheets().create(body=spreadsheet).execute()
+            SHEET_ID = spreadsheet['spreadsheetId']
+            st.success(f"Nueva hoja creada con ID: {SHEET_ID}")
+            return True
+        except Exception as create_error:
+            st.error(f"Error al crear la hoja: {str(create_error)}")
+            return False
+
 def save_sheet_data(df):
     try:
-        service = get_google_sheets_service()
-        spreadsheet_id = os.getenv('GOOGLE_DRIVE_FILE_ID')
+        st.write("Debug - Iniciando guardado en Google Sheets")
         
-        # Reemplazar NaN con cadenas vacías y convertir todos los valores a string
-        df_clean = df.fillna('')
-        
-        # Lista completa de columnas en el orden correcto
-        expected_columns = [
-            'LOCATION',
-            'NAV_BAR',
-            'NAV_ACERCA DE',
-            'NAV_QUE_HACER_EN',
-            'NAV_CUANDO_IR_A',
-            'NAV_LOS_IMPERDIBLES_DE',
-            'CARD_CONOCE_LA_CIUDAD_DE',
-            'TITLE_CONOCE_LA_CIUDAD_DE',
-            'IMG_CONOCE_LA_CIUDAD_DE',
-            'DESCRIP_CONOCE_LA_CIUDAD_DE',
-            'CARD_ACERCA_DEL_AEROPUERTO',
-            'IMG_ACERCA_DEL_AEROPUERTO',
-            'SUBTITLE_ACERCA_DEL_AEROPUERTO',
-            'DESCRIP_ACERCA_DEL_AEROPUERTO',
-            'CARD_QUE_HACER_EN',
-            'TITLE_QUE_HACER_EN',
-            'IMG_QUE_HACER_EN',
-            'SUBTITLE_QUE_HACER_EN',
-            'DESCRIP_QUE_HACER_EN',
-            'CARD_CUANDO_IR_A',
-            'TITLE_CUANDO_IR_A',
-            'SUBTITLE_CUANDO_IR_A',
-            'IMG_1_CUANDO_IR_A',
-            'DESCRIP_CUANDO_IR_A',
-            'IMG_2_CUANDO_IR_A',
-            'CARD_CONOCE_LOS_IMPERDIBLES_DE',
-            'TITLE_CONOCE_LOS_IMPERDIBLES_DE',
-            'IMG_CONOCE_LOS_IMPERDIBLES_DE',
-            'DESCRIP_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_1_TITLE_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_1_IMG_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_1_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_2_TITLE_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_2_IMG_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_2_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_3_TITLE_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_3_IMG_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_3_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_4_TITLE_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_4_IMG_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_4_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE',
-            'CARD_DATOS_IMPORTANTES',
-            'IMG_DATOS_IMPORTANTES',
-            'DESCRIP_DATOS_IMPORTANTES'
-        ]
-        
-        # Asegurarse de que el DataFrame tenga todas las columnas en el orden correcto
-        for col in expected_columns:
-            if col not in df_clean.columns:
-                df_clean[col] = ''
-        
-        # Reordenar las columnas
-        df_clean = df_clean[expected_columns]
-        
-        # Convertir DataFrame a lista de valores, asegurando que todo sea string
-        values = [expected_columns]  # Primera fila son los encabezados
-        for _, row in df_clean.iterrows():
-            values.append([str(val) if pd.notna(val) else '' for val in row])
-        
-        # Construir el rango basado en el número de filas y columnas
-        num_rows = len(values)
-        num_cols = len(expected_columns)
-        
-        st.write("Debug - Preparando datos para guardar:")
-        st.write(f"- Número de filas: {num_rows}")
-        st.write(f"- Número de columnas: {num_cols}")
+        if not sheet_service:
+            st.error("Error: No se ha configurado el servicio de Google Sheets")
+            return False
         
         try:
-            # Obtener metadata del spreadsheet
-            sheet_metadata = service.spreadsheets().get(
-                spreadsheetId=spreadsheet_id
+            # Verificar que la hoja existe
+            if not verify_or_create_sheet():
+                st.error("Error: No se pudo verificar o crear la hoja")
+                return False
+            
+            # Asegurarse de que tenemos todas las columnas necesarias
+            required_columns = [
+                'LOCATION', 'NAV_BAR', 'NAV_ACERCA DE', 'NAV_QUE_HACER_EN', 'NAV_CUANDO_IR_A',
+                'NAV_LOS_IMPERDIBLES_DE', 'CARD_CONOCE_LA_CIUDAD_DE', 'TITLE_CONOCE_LA_CIUDAD_DE',
+                'IMG_CONOCE_LA_CIUDAD_DE', 'DESCRIP_CONOCE_LA_CIUDAD_DE', 'CARD_ACERCA_DEL_AEROPUERTO',
+                'IMG_ACERCA_DEL_AEROPUERTO', 'SUBTITLE_ACERCA_DEL_AEROPUERTO', 'DESCRIP_ACERCA_DEL_AEROPUERTO',
+                'CARD_QUE_HACER_EN', 'TITLE_QUE_HACER_EN', 'IMG_QUE_HACER_EN', 'SUBTITLE_QUE_HACER_EN',
+                'DESCRIP_QUE_HACER_EN', 'CARD_CUANDO_IR_A', 'TITLE_CUANDO_IR_A', 'SUBTITLE_CUANDO_IR_A',
+                'IMG_1_CUANDO_IR_A', 'DESCRIP_CUANDO_IR_A', 'IMG_2_CUANDO_IR_A',
+                'CARD_CONOCE_LOS_IMPERDIBLES_DE', 'TITLE_CONOCE_LOS_IMPERDIBLES_DE',
+                'IMG_CONOCE_LOS_IMPERDIBLES_DE', 'DESCRIP_CONOCE_LOS_IMPERDIBLES_DE',
+                'SUBCARD_1_TITLE_CONOCE_LOS_IMPERDIBLES_DE', 'SUBCARD_1_IMG_CONOCE_LOS_IMPERDIBLES_DE',
+                'SUBCARD_1_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE', 'SUBCARD_2_TITLE_CONOCE_LOS_IMPERDIBLES_DE',
+                'SUBCARD_2_IMG_CONOCE_LOS_IMPERDIBLES_DE', 'SUBCARD_2_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE',
+                'SUBCARD_3_TITLE_CONOCE_LOS_IMPERDIBLES_DE', 'SUBCARD_3_IMG_CONOCE_LOS_IMPERDIBLES_DE',
+                'SUBCARD_3_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE', 'SUBCARD_4_TITLE_CONOCE_LOS_IMPERDIBLES_DE',
+                'SUBCARD_4_IMG_CONOCE_LOS_IMPERDIBLES_DE', 'SUBCARD_4_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE',
+                'CARD_DATOS_IMPORTANTES', 'IMG_DATOS_IMPORTANTES', 'DESCRIP_DATOS_IMPORTANTES'
+            ]
+            
+            # Asegurarse de que el DataFrame tiene todas las columnas necesarias
+            for col in required_columns:
+                if col not in df.columns:
+                    df[col] = ''
+            
+            # Reordenar las columnas según el orden requerido
+            df = df[required_columns]
+            
+            # Convertir el DataFrame a una lista de listas para Google Sheets
+            values = [required_columns]  # Primero los encabezados
+            
+            # Convertir los valores del DataFrame a strings y reemplazar None/NaN por cadenas vacías
+            for _, row in df.iterrows():
+                row_values = []
+                for col in required_columns:
+                    val = row[col]
+                    if pd.isna(val) or val is None:
+                        val = ''
+                    row_values.append(str(val))
+                values.append(row_values)
+            
+            st.write(f"Debug - Preparados {len(values)} registros para enviar")
+            
+            # Limpiar la hoja existente
+            sheet_service.spreadsheets().values().clear(
+                spreadsheetId=SHEET_ID,
+                range='Destinos!A:ZZ'  # Limpia todas las columnas
             ).execute()
             
-            # Convertir número de columnas a letras
-            def num_to_col_letter(n):
-                result = ""
-                while n > 0:
-                    n, remainder = divmod(n - 1, 26)
-                    result = chr(65 + remainder) + result
-                return result
-            
-            last_col = num_to_col_letter(num_cols)
-            range_name = f"'Destinos'!A1:{last_col}{num_rows}"
-            
-            st.write(f"Debug - Rango a escribir: {range_name}")
-            
-            # Limpiar el contenido existente en la hoja Destinos
-            clear_result = service.spreadsheets().values().clear(
-                spreadsheetId=spreadsheet_id,
-                range="'Destinos'",
-                body={}
-            ).execute()
+            st.write("Debug - Hoja limpiada exitosamente")
             
             # Escribir los nuevos datos
-            result = service.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=range_name,
+            body = {
+                'values': values,
+                'majorDimension': 'ROWS'
+            }
+            
+            result = sheet_service.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range='Destinos!A1',  # Comienza desde A1
                 valueInputOption='RAW',
-                body={'values': values}
+                body=body
             ).execute()
             
-            st.success(f"✅ Se actualizaron {result.get('updatedCells')} celdas en la hoja 'Destinos'")
+            st.write(f"Debug - Datos guardados exitosamente: {result.get('updatedCells')} celdas actualizadas")
+            st.write(f"Debug - Rango actualizado: {result.get('updatedRange')}")
+            st.success(f"✅ Datos guardados en Google Sheets. ID de la hoja: {SHEET_ID}")
             return True
             
         except Exception as e:
-            st.error(f"Error al actualizar la hoja 'Destinos': {str(e)}")
-            if hasattr(e, 'content'):
-                st.error(f"Detalles adicionales: {e.content.decode('utf-8') if isinstance(e.content, bytes) else e.content}")
+            st.error(f"Error específico al guardar en Google Sheets: {str(e)}")
             return False
             
     except Exception as e:
-        st.error(f"❌ Error al guardar los datos: {str(e)}")
-        if hasattr(e, 'content'):
-            st.error(f"Detalles adicionales: {e.content.decode('utf-8') if isinstance(e.content, bytes) else e.content}")
+        st.error(f"Error general al guardar en Google Sheets: {str(e)}")
         return False
 
 # Función para generar contenido con IA
 def generate_content(location: str) -> Dict[str, str]:
     try:
         st.write("Debug - Iniciando generación de contenido para:", location)
-        st.write("Debug - API Key configurada:", "Sí" if api_key else "No")
-        
-        # Lista ordenada de campos esperados
-        expected_fields = [
-            'LOCATION',
-            'NAV_BAR',
-            'NAV_ACERCA DE',
-            'NAV_QUE_HACER_EN',
-            'NAV_CUANDO_IR_A',
-            'NAV_LOS_IMPERDIBLES_DE',
-            'CARD_CONOCE_LA_CIUDAD_DE',
-            'TITLE_CONOCE_LA_CIUDAD_DE',
-            'IMG_CONOCE_LA_CIUDAD_DE',
-            'DESCRIP_CONOCE_LA_CIUDAD_DE',
-            'CARD_ACERCA_DEL_AEROPUERTO',
-            'IMG_ACERCA_DEL_AEROPUERTO',
-            'SUBTITLE_ACERCA_DEL_AEROPUERTO',
-            'DESCRIP_ACERCA_DEL_AEROPUERTO',
-            'CARD_QUE_HACER_EN',
-            'TITLE_QUE_HACER_EN',
-            'IMG_QUE_HACER_EN',
-            'SUBTITLE_QUE_HACER_EN',
-            'DESCRIP_QUE_HACER_EN',
-            'CARD_CUANDO_IR_A',
-            'TITLE_CUANDO_IR_A',
-            'SUBTITLE_CUANDO_IR_A',
-            'IMG_1_CUANDO_IR_A',
-            'DESCRIP_CUANDO_IR_A',
-            'IMG_2_CUANDO_IR_A',
-            'CARD_CONOCE_LOS_IMPERDIBLES_DE',
-            'TITLE_CONOCE_LOS_IMPERDIBLES_DE',
-            'IMG_CONOCE_LOS_IMPERDIBLES_DE',
-            'DESCRIP_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_1_TITLE_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_1_IMG_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_1_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_2_TITLE_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_2_IMG_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_2_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_3_TITLE_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_3_IMG_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_3_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_4_TITLE_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_4_IMG_CONOCE_LOS_IMPERDIBLES_DE',
-            'SUBCARD_4_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE',
-            'CARD_DATOS_IMPORTANTES',
-            'IMG_DATOS_IMPORTANTES',
-            'DESCRIP_DATOS_IMPORTANTES'
-        ]
         
         # Inicializar el diccionario con valores por defecto
         content_dict = {
@@ -359,92 +320,119 @@ def generate_content(location: str) -> Dict[str, str]:
             'DESCRIP_DATOS_IMPORTANTES': ''
         }
         
+        # Generar el prompt para OpenAI
         prompt = f"""
-        Actúa como un creador de contenido especializado en turismo y panoramas, con experiencia redactando para aerolíneas low-cost como JetSMART.
-        Genera contenido para la ciudad de {location}. Solo necesito que generes el contenido para las siguientes descripciones, manteniendo el resto de campos vacíos o con sus valores por defecto:
+        Actúa como un redactor profesional especializado en turismo y SEO para aerolíneas low-cost como JetSMART. Tu tarea es generar contenido completo, útil y atractivo para {location} que será publicado en la sección de guía de destinos del sitio web.
 
-        DESCRIP_CONOCE_LA_CIUDAD_DE: [descripción detallada de la ciudad, similar a: "La Perla Del Norte" o Capital Minera se ubica al Norte de la costa del pacífico y se destaca por su gastronomía, historia, patrimonio, paisajes, turismo aventura, entretención y vida nocturna, todo lo que hará de tu viaje una experiencia totalmente SMART.]
+        🔍 Tu contenido debe seguir la estructura exacta de un Excel, tal como en el ejemplo de Antofagasta. Cada celda debe contener el tipo de información que corresponde, sin agregar campos nuevos ni alterar los existentes.
 
-        SUBTITLE_ACERCA_DEL_AEROPUERTO: [nombre del aeropuerto]
-        DESCRIP_ACERCA_DEL_AEROPUERTO: [descripción detallada del aeropuerto y cómo llegar a la ciudad]
+        📚 ESTRUCTURA QUE DEBES COMPLETAR:
 
-        SUBTITLE_QUE_HACER_EN: [subtítulo breve]
-        DESCRIP_QUE_HACER_EN: [descripción de actividades y lugares para visitar]
+        DESCRIP_CONOCE_LA_CIUDAD_DE:
+        [Introduce el destino destacando su identidad, estilo de viaje (aventura, descanso, cultura), lo más representativo y actual: paisajes, ambiente, vida local o eventos.]
 
-        TITLE_CUANDO_IR_A: [título breve]
-        SUBTITLE_CUANDO_IR_A: [subtítulo sobre la mejor época]
-        DESCRIP_CUANDO_IR_A: [descripción detallada sobre cuándo visitar]
+        SUBTITLE_ACERCA_DEL_AEROPUERTO:
+        [Nombre del aeropuerto]
 
-        SUBCARD_1_TITLE_CONOCE_LOS_IMPERDIBLES_DE: [nombre del primer lugar imperdible]
-        SUBCARD_1_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE: [descripción del primer lugar]
+        DESCRIP_ACERCA_DEL_AEROPUERTO:
+        [Explica dónde está ubicado, cómo se conecta con la ciudad, cuánto demora el trayecto, y qué medios existen (transporte público, transfer, aplicaciones de transporte).]
 
-        SUBCARD_2_TITLE_CONOCE_LOS_IMPERDIBLES_DE: [nombre del segundo lugar imperdible]
-        SUBCARD_2_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE: [descripción del segundo lugar]
+        SUBTITLE_QUE_HACER_EN:
+        [Subtítulo atractivo para la sección]
 
-        SUBCARD_3_TITLE_CONOCE_LOS_IMPERDIBLES_DE: [nombre del tercer lugar imperdible]
-        SUBCARD_3_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE: [descripción del tercer lugar]
+        DESCRIP_QUE_HACER_EN:
+        [Recomienda actividades variadas: cultura, gastronomía, vida urbana, naturaleza. Puedes incluir panoramas clásicos y otros más actuales o únicos del lugar.]
 
-        SUBCARD_4_TITLE_CONOCE_LOS_IMPERDIBLES_DE: [nombre del cuarto lugar imperdible]
-        SUBCARD_4_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE: [descripción del cuarto lugar]
+        SUBTITLE_CUANDO_IR_A:
+        [Resumen de temporada ideal]
 
-        DESCRIP_DATOS_IMPORTANTES: [información práctica sobre la ciudad]
+        DESCRIP_CUANDO_IR_A:
+        [Describe la mejor época para visitar según clima, actividades, festivales, precios o experiencias especiales. Incluye ventajas de temporada alta y baja.]
 
-        Responde SOLO con el contenido solicitado, manteniendo el formato exacto de los nombres de los campos.
+        DESCRIP_CONOCE_LOS_IMPERDIBLES_DE:
+        [Haz un resumen general de los panoramas más llamativos, sin repetir literalmente los 4 que vendrán, pero puedes anticiparlos sutilmente.]
+
+        SUBCARD_1_TITLE_CONOCE_LOS_IMPERDIBLES_DE:
+        [Nombre del primer panorama imperdible]
+
+        SUBCARD_1_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE:
+        [¿Qué es? ¿Qué se hace? ¿Por qué es imperdible? ¿Es gratuito o de pago? Precio estimado si aplica. Tips útiles.]
+
+        SUBCARD_2_TITLE_CONOCE_LOS_IMPERDIBLES_DE:
+        [Nombre del segundo panorama imperdible]
+
+        SUBCARD_2_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE:
+        [Descripción detallada siguiendo el mismo formato]
+
+        SUBCARD_3_TITLE_CONOCE_LOS_IMPERDIBLES_DE:
+        [Nombre del tercer panorama imperdible]
+
+        SUBCARD_3_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE:
+        [Descripción detallada siguiendo el mismo formato]
+
+        SUBCARD_4_TITLE_CONOCE_LOS_IMPERDIBLES_DE:
+        [Nombre del cuarto panorama imperdible]
+
+        SUBCARD_4_DESCRIP__CONOCE_LOS_IMPERDIBLES_DE:
+        [Descripción detallada siguiendo el mismo formato]
+
+        DESCRIP_DATOS_IMPORTANTES:
+        [Consejos prácticos para el viaje incluyendo transporte, clima, seguridad, costumbres locales y tips para turistas.]
+
+        💡 IMPORTANTE: Para cada panorama imperdible, asegúrate de proporcionar un título claro y descriptivo en el campo SUBCARD_X_TITLE_CONOCE_LOS_IMPERDIBLES_DE.
+
+        Responde SOLO con el contenido solicitado para cada campo, manteniendo el formato exacto de los nombres de los campos.
         """
         
-        st.write("Debug - Enviando prompt a OpenAI...")
-        
+        # Llamar a OpenAI para generar el contenido
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "Eres un experto en contenido turístico para JetSMART. Genera solo el contenido solicitado, manteniendo los nombres de los campos exactamente como se muestran."},
+                {"role": "system", "content": "Eres un experto en contenido turístico para JetSMART. Genera contenido atractivo y útil para viajeros."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
             max_tokens=2000
         )
         
-        st.write("Debug - Respuesta recibida de OpenAI")
+        # Procesar la respuesta y actualizar el diccionario
         content = response.choices[0].message.content
+        lines = content.split('\n')
         
-        # Procesar la respuesta línea por línea
         current_field = None
-        for line in content.split('\n'):
+        current_value = []
+        
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
-            
-            # Buscar campos que coincidan exactamente con los esperados
-            if ':' in line:
-                parts = line.split(':', 1)
-                if len(parts) == 2:
-                    field = parts[0].strip()
-                    value = parts[1].strip()
-                    if field in expected_fields:
-                        content_dict[field] = value
-                        st.write(f"Debug - Campo actualizado: {field}")
-            elif current_field and current_field in expected_fields:
-                content_dict[current_field] += ' ' + line
+                
+            # Buscar campos en la línea
+            field_found = False
+            for field in content_dict.keys():
+                if line.startswith(field + ':'):
+                    # Si teníamos un campo anterior, guardamos su valor
+                    if current_field and current_value:
+                        content_dict[current_field] = ' '.join(current_value)
+                    
+                    # Comenzamos con el nuevo campo
+                    current_field = field
+                    current_value = [line.split(':', 1)[1].strip()]
+                    field_found = True
+                    break
+                    
+            # Si no encontramos un nuevo campo, agregamos la línea al valor actual
+            if not field_found and current_field:
+                current_value.append(line)
         
-        # Verificar que los campos principales tengan contenido
-        main_fields = [
-            'DESCRIP_CONOCE_LA_CIUDAD_DE',
-            'DESCRIP_ACERCA_DEL_AEROPUERTO',
-            'DESCRIP_QUE_HACER_EN',
-            'DESCRIP_CUANDO_IR_A',
-            'DESCRIP_DATOS_IMPORTANTES'
-        ]
-        empty_fields = [field for field in main_fields if not content_dict[field]]
-        if empty_fields:
-            st.warning(f"Los siguientes campos importantes están vacíos: {', '.join(empty_fields)}")
+        # No olvidar guardar el último campo
+        if current_field and current_value:
+            content_dict[current_field] = ' '.join(current_value)
         
         return content_dict
     except Exception as e:
         st.error(f"Error al generar contenido: {str(e)}")
-        st.error(f"Detalles adicionales del error: {type(e).__name__}")
-        import traceback
-        st.error(f"Traceback: {traceback.format_exc()}")
-        return {}
+        return None
 
 # Función para mostrar y editar contenido
 def show_edit_content(location_data: pd.Series):
@@ -586,38 +574,120 @@ def init_db():
     """Inicializar la base de datos SQLite"""
     try:
         conn = sqlite3.connect('destinos.db')
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS destinos
-                    (location TEXT PRIMARY KEY, 
-                     content JSON,
-                     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        cursor = conn.cursor()
+        
+        # Crear tabla si no existe
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS destinos (
+                location TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Verificar que la tabla existe y tiene la estructura correcta
+        cursor.execute("PRAGMA table_info(destinos)")
+        columns = cursor.fetchall()
+        required_columns = {'location', 'content', 'last_updated'}
+        existing_columns = {col[1] for col in columns}
+        
+        if not required_columns.issubset(existing_columns):
+            st.error("Error: La tabla no tiene la estructura correcta")
+            return False
+        
         conn.commit()
         conn.close()
-        st.success("✅ Base de datos inicializada correctamente")
+        st.write("Debug - Base de datos inicializada correctamente")
+        return True
     except Exception as e:
         st.error(f"Error al inicializar la base de datos: {str(e)}")
+        return False
 
-def save_to_db(df, location=None):
-    """Guardar datos en SQLite"""
+def save_to_db(location, content):
     try:
+        st.write("Debug - Iniciando guardado en base de datos local")
+        
+        # Asegurarse de que la base de datos está inicializada
+        if not init_db():
+            st.error("Error al inicializar la base de datos")
+            return False
+            
+        # Guardar en la base de datos SQLite
         conn = sqlite3.connect('destinos.db')
-        if location:
-            # Guardar solo la fila específica
-            row = df[df['LOCATION'] == location].iloc[0]
-            content = row.to_json()
-            conn.execute('''INSERT OR REPLACE INTO destinos (location, content, last_updated) 
-                          VALUES (?, ?, CURRENT_TIMESTAMP)''', 
-                       (location, content))
+        cursor = conn.cursor()
+        
+        # Verificar si el registro existe
+        cursor.execute('SELECT * FROM destinos WHERE location = ?', (location,))
+        exists = cursor.fetchone()
+        
+        if exists:
+            st.write(f"Debug - Actualizando registro existente para {location}")
         else:
-            # Guardar todo el DataFrame
-            for _, row in df.iterrows():
-                content = row.to_json()
-                conn.execute('''INSERT OR REPLACE INTO destinos (location, content, last_updated) 
-                              VALUES (?, ?, CURRENT_TIMESTAMP)''', 
-                           (row['LOCATION'], content))
-        conn.commit()
-        conn.close()
-        return True
+            st.write(f"Debug - Creando nuevo registro para {location}")
+        
+        # Convertir el diccionario a JSON para almacenamiento
+        try:
+            content_json = json.dumps(content, ensure_ascii=False)
+        except Exception as json_error:
+            st.error(f"Error al convertir contenido a JSON: {str(json_error)}")
+            return False
+        
+        # Insertar o actualizar en la base de datos
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO destinos (location, content, last_updated)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            ''', (location, content_json))
+            
+            conn.commit()
+            st.write(f"Debug - Contenido guardado en SQLite para {location}")
+            
+            # Verificar que el registro se guardó correctamente
+            cursor.execute('SELECT * FROM destinos WHERE location = ?', (location,))
+            saved_record = cursor.fetchone()
+            if not saved_record:
+                st.error("Error: El registro no se guardó correctamente")
+                return False
+                
+        except Exception as db_error:
+            st.error(f"Error al guardar en la base de datos: {str(db_error)}")
+            return False
+        finally:
+            conn.close()
+        
+        # Luego guardamos en Google Sheets
+        try:
+            # Cargar todos los datos de la base de datos
+            conn = sqlite3.connect('destinos.db')
+            cursor = conn.cursor()
+            cursor.execute('SELECT location, content FROM destinos')
+            rows = cursor.fetchall()
+            conn.close()
+            
+            # Convertir los datos a DataFrame
+            all_data = []
+            for row in rows:
+                location_data = row[0]
+                content_data = json.loads(row[1])
+                all_data.append(content_data)
+            
+            df = pd.DataFrame(all_data)
+            st.write("Debug - DataFrame creado con todos los registros")
+            st.write(f"Debug - Columnas en el DataFrame: {df.columns.tolist()}")
+            
+            # Intentar guardar en Google Sheets
+            if save_sheet_data(df):
+                st.success(f"✅ Contenido guardado exitosamente para {location} en base de datos y Google Sheets")
+                return True
+            else:
+                st.warning(f"⚠️ Contenido guardado en la base de datos pero hubo un error al guardar en Google Sheets")
+                return False
+                
+        except Exception as sheet_error:
+            st.error(f"Error al guardar en Google Sheets: {str(sheet_error)}")
+            st.warning("✓ Contenido guardado solo en la base de datos local")
+            return True
+            
     except Exception as e:
         st.error(f"Error al guardar en la base de datos: {str(e)}")
         return False
@@ -660,9 +730,91 @@ def sync_with_sheets():
         st.error(f"❌ Error en la sincronización: {str(e)}")
         return False
 
+def get_google_credentials():
+    try:
+        # Check if running on Streamlit Cloud
+        if st.runtime.exists():
+            credentials_dict = st.secrets["google"]["credentials"]
+            if isinstance(credentials_dict, str):
+                credentials_dict = json.loads(credentials_dict)
+            creds = service_account.Credentials.from_service_account_info(
+                credentials_dict,
+                scopes=['https://www.googleapis.com/auth/spreadsheets',
+                       'https://www.googleapis.com/auth/drive.file',
+                       'https://www.googleapis.com/auth/drive']
+            )
+            return creds
+        else:
+            # Local environment authentication
+            if os.path.exists('token.json'):
+                try:
+                    return Credentials.from_authorized_user_file('token.json', SCOPES)
+                except Exception as e:
+                    st.warning(f"Token inválido, solicitando nueva autenticación: {str(e)}")
+                    os.remove('token.json')
+            
+            if os.path.exists('credentials.json'):
+                try:
+                    flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                    creds = flow.run_local_server(port=0, success_message="Autenticación exitosa!")
+                    with open('token.json', 'w') as token:
+                        token.write(creds.to_json())
+                    return creds
+                except Exception as e:
+                    st.error(f"Error en la autenticación: {str(e)}")
+                    return None
+            else:
+                st.error("No se encontró el archivo credentials.json")
+                return None
+    except Exception as e:
+        st.error(f"Error durante la autorización: {str(e)}")
+        return None
+
+def connect_to_google_sheets():
+    try:
+        creds = get_google_credentials()
+        if not creds:
+            st.warning("No se pudo conectar con Google Sheets. La aplicación funcionará con almacenamiento local.")
+            return None
+
+        service = build('sheets', 'v4', credentials=creds)
+        return service
+    except Exception as e:
+        st.warning(f"No se pudo conectar con Google Sheets: {str(e)}. La aplicación funcionará con almacenamiento local.")
+        return None
+
+def clean_database():
+    """Limpiar la base de datos y mantener solo Antofagasta"""
+    try:
+        conn = sqlite3.connect('destinos.db')
+        c = conn.cursor()
+        
+        # Obtener el contenido de Antofagasta
+        c.execute("SELECT content FROM destinos WHERE location = 'ANTOFAGASTA'")
+        antofagasta_content = c.fetchone()
+        
+        # Eliminar todos los registros
+        c.execute("DELETE FROM destinos")
+        
+        # Si existe el contenido de Antofagasta, volver a insertarlo
+        if antofagasta_content:
+            c.execute("INSERT INTO destinos (location, content) VALUES (?, ?)", 
+                     ('ANTOFAGASTA', antofagasta_content[0]))
+        
+        conn.commit()
+        conn.close()
+        st.success("✅ Base de datos limpiada exitosamente. Solo se mantiene Antofagasta.")
+    except Exception as e:
+        st.error(f"Error al limpiar la base de datos: {str(e)}")
+
 def main():
     # Inicializar la base de datos
     init_db()
+    
+    # Agregar botón para limpiar la base de datos
+    if st.sidebar.button("🔄 Limpiar Base de Datos (Mantener solo Antofagasta)"):
+        clean_database()
+        st.experimental_rerun()
     
     # Verificar credenciales de Google Sheets
     service = get_google_sheets_service()
@@ -720,7 +872,7 @@ def main():
                             st.session_state.df = pd.concat([st.session_state.df, new_row], ignore_index=True)
                             
                             # Guardar automáticamente en la base de datos
-                            if save_to_db(st.session_state.df, location):
+                            if save_to_db(location, new_content):
                                 st.success(f"✨ Contenido guardado exitosamente para {location}")
                                 # Intentar sincronizar con Google Sheets
                                 sync_with_sheets()
@@ -753,7 +905,7 @@ def main():
                     st.session_state.df.loc[st.session_state.df['LOCATION'] == selected_location, col] = value
                 
                 # Guardar automáticamente en la base de datos
-                if save_to_db(st.session_state.df, selected_location):
+                if save_to_db(selected_location, edited_data):
                     st.success("✅ Cambios guardados exitosamente!")
                     # Intentar sincronizar con Google Sheets
                     sync_with_sheets()
