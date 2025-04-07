@@ -16,11 +16,12 @@ import json
 from google.oauth2 import service_account
 import pickle
 
-# Configuración de la página
+# Configuración de la página (debe ser la primera llamada a Streamlit)
 st.set_page_config(
-    page_title="JetSMART Content Manager",
+    page_title="Destinos AI",
     page_icon="✈️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 # Cargar variables de entorno
@@ -731,43 +732,30 @@ def sync_with_sheets():
         return False
 
 def get_google_credentials():
+    """Obtiene las credenciales de Google Sheets"""
     try:
-        # Check if running on Streamlit Cloud
-        if st.runtime.exists():
-            credentials_dict = st.secrets["google"]["credentials"]
-            if isinstance(credentials_dict, str):
-                credentials_dict = json.loads(credentials_dict)
-            creds = service_account.Credentials.from_service_account_info(
-                credentials_dict,
-                scopes=['https://www.googleapis.com/auth/spreadsheets',
-                       'https://www.googleapis.com/auth/drive.file',
-                       'https://www.googleapis.com/auth/drive']
-            )
-            return creds
-        else:
-            # Local environment authentication
-            if os.path.exists('token.json'):
-                try:
-                    return Credentials.from_authorized_user_file('token.json', SCOPES)
-                except Exception as e:
-                    st.warning(f"Token inválido, solicitando nueva autenticación: {str(e)}")
-                    os.remove('token.json')
-            
-            if os.path.exists('credentials.json'):
-                try:
-                    flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-                    creds = flow.run_local_server(port=0, success_message="Autenticación exitosa!")
-                    with open('token.json', 'w') as token:
-                        token.write(creds.to_json())
-                    return creds
-                except Exception as e:
-                    st.error(f"Error en la autenticación: {str(e)}")
-                    return None
+        creds = None
+        # El archivo token.pickle almacena los tokens de acceso y actualización del usuario
+        if os.path.exists('token.pickle'):
+            with open('token.pickle', 'rb') as token:
+                creds = pickle.load(token)
+        
+        # Si no hay credenciales válidas, solicita al usuario que se autentique
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
             else:
-                st.error("No se encontró el archivo credentials.json")
-                return None
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    'credentials.json', SCOPES)
+                creds = flow.run_local_server(port=0)
+            
+            # Guarda las credenciales para la próxima ejecución
+            with open('token.pickle', 'wb') as token:
+                pickle.dump(creds, token)
+        
+        return creds
     except Exception as e:
-        st.error(f"Error durante la autorización: {str(e)}")
+        st.error(f"Error al obtener credenciales de Google: {str(e)}")
         return None
 
 def connect_to_google_sheets():
@@ -810,6 +798,14 @@ def clean_database():
 def main():
     # Inicializar la base de datos
     init_db()
+    
+    # Verificar credenciales de Google al inicio
+    if 'google_creds' not in st.session_state:
+        st.session_state.google_creds = get_google_credentials()
+    
+    if st.session_state.google_creds is None:
+        st.error("No se pudieron obtener las credenciales de Google. Por favor, verifica tu conexión y credenciales.")
+        return
     
     # Agregar botón para limpiar la base de datos
     if st.sidebar.button("🔄 Limpiar Base de Datos (Mantener solo Antofagasta)"):
