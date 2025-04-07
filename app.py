@@ -38,7 +38,8 @@ client = OpenAI(api_key=api_key)
 
 # Configuración de Google Sheets
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file']
-SHEET_ID = '1OCZfwayh4yUplVjGc2xZTrroYvO22SiC48sbGbKylt8'  # ID correcto de la hoja
+SHEET_ID = os.getenv('GOOGLE_DRIVE_FILE_ID')  # Usar el ID del .env
+SHEET_NAME = 'Destinos'  # Nombre consistente de la hoja
 CREDENTIALS_FILE = 'credentials.json'
 TOKEN_FILE = 'token.pickle'
 
@@ -97,19 +98,21 @@ sheet_service = get_google_sheets_service()
 def load_sheet_data():
     try:
         service = get_google_sheets_service()
-        spreadsheet_id = os.getenv('GOOGLE_DRIVE_FILE_ID')
-        
+        if not service:
+            st.error("No se pudo obtener el servicio de Google Sheets")
+            return None
+            
         # Obtener los valores de la hoja
         result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range="'Hoja 1'"  # Mantener Hoja 1 para lectura
+            spreadsheetId=SHEET_ID,
+            range=f"'{SHEET_NAME}'"  # Usar el nombre consistente de la hoja
         ).execute()
         
         values = result.get('values', [])
         
         if not values:
-            st.error("No se encontraron datos en la hoja.")
-            return None
+            st.warning("No se encontraron datos en la hoja de Google Sheets.")
+            return pd.DataFrame()
             
         # Convertir a DataFrame
         df = pd.DataFrame(values[1:], columns=values[0])
@@ -119,7 +122,7 @@ def load_sheet_data():
         
         return df
     except Exception as e:
-        st.error(f"Error al cargar los datos: {str(e)}")
+        st.error(f"Error al cargar datos de Google Sheets: {str(e)}")
         return None
 
 def verify_or_create_sheet():
@@ -703,9 +706,16 @@ def load_from_db():
         
         if not df.empty:
             # Convertir JSON a columnas
-            content_df = pd.json_normalize([json.loads(content) for content in df['content']])
+            content_df = pd.DataFrame()
+            for _, row in df.iterrows():
+                try:
+                    content_data = json.loads(row['content'])
+                    content_df = pd.concat([content_df, pd.DataFrame([content_data])], ignore_index=True)
+                except json.JSONDecodeError as e:
+                    st.error(f"Error al decodificar JSON para {row['location']}: {str(e)}")
+                    continue
             return content_df
-        return pd.DataFrame(columns=expected_columns)
+        return pd.DataFrame()  # Retornar DataFrame vacío si no hay datos
     except Exception as e:
         st.error(f"Error al cargar desde la base de datos: {str(e)}")
         return None
@@ -795,6 +805,45 @@ def clean_database():
     except Exception as e:
         st.error(f"Error al limpiar la base de datos: {str(e)}")
 
+def clean_databases():
+    """Limpia las bases de datos dejando solo los datos de Antofagasta"""
+    try:
+        # Limpiar SQLite
+        conn = sqlite3.connect('destinos.db')
+        cursor = conn.cursor()
+        
+        # Guardar los datos de Antofagasta
+        cursor.execute('SELECT * FROM destinos WHERE location = ?', ('ANTOFAGASTA',))
+        antofagasta_data = cursor.fetchone()
+        
+        if not antofagasta_data:
+            st.error("No se encontraron datos de Antofagasta en la base de datos local")
+            return False
+        
+        # Eliminar todos los registros excepto Antofagasta
+        cursor.execute('DELETE FROM destinos WHERE location != ?', ('ANTOFAGASTA',))
+        conn.commit()
+        conn.close()
+        
+        st.success("Base de datos local limpiada exitosamente")
+        
+        # Actualizar Google Sheets
+        df = load_from_db()  # Cargar solo los datos de Antofagasta
+        if df is not None:
+            if save_sheet_data(df):
+                st.success("Google Sheets actualizado exitosamente")
+                return True
+            else:
+                st.error("Error al actualizar Google Sheets")
+                return False
+        else:
+            st.error("Error al cargar datos de la base de datos local")
+            return False
+            
+    except Exception as e:
+        st.error(f"Error durante la limpieza de las bases de datos: {str(e)}")
+        return False
+
 def main():
     # Inicializar la base de datos
     init_db()
@@ -806,11 +855,6 @@ def main():
     if st.session_state.google_creds is None:
         st.error("No se pudieron obtener las credenciales de Google. Por favor, verifica tu conexión y credenciales.")
         return
-    
-    # Agregar botón para limpiar la base de datos
-    if st.sidebar.button("🔄 Limpiar Base de Datos (Mantener solo Antofagasta)"):
-        clean_database()
-        st.experimental_rerun()
     
     # Verificar credenciales de Google Sheets
     service = get_google_sheets_service()
